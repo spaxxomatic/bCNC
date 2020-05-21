@@ -15,7 +15,8 @@ import undo
 import Unicode
 import pickle
 import json
-#import binascii
+import binascii
+import traceback
 
 from dxf	import DXF
 from bstl	import Binary_STL_Writer
@@ -117,7 +118,7 @@ ERROR_HANDLING = {}
 TOLERANCE = 1e-7
 MAXINT    = 1000000000	# python3 doesn't have maxint
 
-
+class ParsingException(Exception): pass
 #------------------------------------------------------------------------------
 # Return a value combined from two dictionaries new/old
 #------------------------------------------------------------------------------
@@ -803,9 +804,15 @@ class CNC:
 	#----------------------------------------------------------------------
 	@staticmethod
 	def loadConfig(config):
+		print ("Loading config")
 		section = "CNC"
 		try: CNC.inch           = bool(int(config.get(section, "units")))
 		except: pass
+		try: 
+			CNC.use_micron_gcode = bool(int(config.get(section, "use_micron_gcode")))
+			print ("Expecting Deckel format G-code (micron units)")
+		except: 
+			CNC.use_micron_gcode = False
 		try: CNC.lasercutter    = bool(int(config.get(section, "lasercutter")))
 		except: pass
 		try: CNC.laseradaptive  = bool(int(config.get(section, "laseradaptive")))
@@ -1275,7 +1282,13 @@ class CNC:
 	# Create path for one g command
 	#----------------------------------------------------------------------
 	def motionStart(self, cmds):
-		#print "\n<<<",cmds
+		def parse_val(val):
+			return val*self.unit
+		#BKM nutiu
+		#traceback.print_stack()
+		if cmds[0][0] == 'N': #line number, ignore
+			cmds.pop(0)
+		#print(cmds)
 		self.mval = 0	# reset m command
 		for cmd in cmds:
 			c = cmd[0].upper()
@@ -1285,19 +1298,19 @@ class CNC:
 				value = 0
 
 			if   c == "X":
-				self.xval = value*self.unit
+				self.xval = parse_val(value)
 				if not self.absolute:
 					self.xval += self.x
 				self.dx = self.xval - self.x
 
 			elif c == "Y":
-				self.yval = value*self.unit
+				self.yval = parse_val(value)
 				if not self.absolute:
 					self.yval += self.y
 				self.dy = self.yval - self.y
 
 			elif c == "Z":
-				self.zval = value*self.unit
+				self.zval = parse_val(value)		
 				if not self.absolute:
 					self.zval += self.z
 				self.dz = self.zval - self.z
@@ -1367,17 +1380,17 @@ class CNC:
 					self.gcode = gcode
 
 			elif c == "I":
-				self.ival = value*self.unit
+				self.ival = parse_val(value)
 				if self.arcabsolute:
 					self.ival -= self.x
 
 			elif c == "J":
-				self.jval = value*self.unit
+				self.jval = parse_val(value)		
 				if self.arcabsolute:
 					self.jval -= self.y
 
 			elif c == "K":
-				self.kval = value*self.unit
+				self.kval = parse_val(value)		
 				if self.arcabsolute:
 					self.kval -= self.z
 
@@ -1394,22 +1407,22 @@ class CNC:
 				self.pval = value
 
 			elif c == "Q":
-				self.qval = value*self.unit
+				self.qval = parse_val(value)
 
 			elif c == "R":
-				self.rval = value*self.unit
+				self.rval = parse_val(value)
 
 			elif c == "T":
 				self.tool = int(value)
 
 			elif c == "U":
-				self.uval = value*self.unit
+				self.uval = parse_val(value)
 
 			elif c == "V":
-				self.vval = value*self.unit
+				self.vval = parse_val(value)
 
 			elif c == "W":
-				self.wval = value*self.unit
+				self.wval = parse_val(value)
 
 	#----------------------------------------------------------------------
 	# Return center x,y,z,r for arc motions 2,3 and set self.rval
@@ -1722,7 +1735,7 @@ class CNC:
 			newcmd = []
 			cmds = CNC.compileLine(line)
 			if cmds is None: continue
-			if isinstance(cmds,str):
+			if isinstance(cmds,str) or isinstance(cmds,unicode):
 				cmds = CNC.breakLine(cmds)
 			else:
 				# either CodeType or tuple, list[] append it as is
@@ -2318,9 +2331,28 @@ class GCode:
 	# Load a file into editor
 	#----------------------------------------------------------------------
 	def load(self, filename=None):
+		prog = re.compile("[X]")
+
+		def preprocess(line):
+			#BKM nutiu
+			#some old machines have X,Y,Z,I,J,K coords in micron instead of mm
+			if CNC.use_micron_gcode:
+				cmds = CNC.parseLine(line)
+				if cmds:
+					#print(cmds)
+					for idx, c in enumerate(cmds):
+						if len(c) > 1 and c[0] in ('X','Y','Z','I','J','K'):
+							val = c[1:]
+							if '.' in val:
+								raise ParsingException("Wrong format. Expected a micron value at line %s"%line)
+							cmds[idx] = "%s%0.3f"%(c[0], (float(val)/1000))
+							#print cmds[idx]				
+							line = "".join(cmds)
+			return line
 		if filename is None: filename = self.filename
 		self.init()
 		self.filename = filename
+		print ("Loading file %s"%filename)
 		try: f = open(self.filename,"r")
 		except: return False
 		self._lastModified = os.stat(self.filename).st_mtime
@@ -2328,7 +2360,7 @@ class GCode:
 		self.cnc.resetAllMargins()
 		self._blocksExist = False
 		for line in f:
-			self._addLine(line[:-1].replace("\x0d",""))
+			self._addLine(preprocess(line[:-1].replace("\x0d","")))
 		self._trim()
 		f.close()
 		return True
@@ -2522,7 +2554,7 @@ class GCode:
 		if empty: self.addBlockFromString("Header",self.header)
 
 		#FIXME: UI to set SVG subdivratio
-		for path in svgcode.get_gcode(self.SVGscale(), 0.5, CNC.digits):
+		for path in svgcode.get_gcode(self.SVGscale(), 10, CNC.digits):
 			self.addBlockFromString(path['id'],path['path'])
 
 		if empty: self.addBlockFromString("Footer",self.footer)
@@ -3224,7 +3256,7 @@ class GCode:
 			if cmds is None:
 				new.append(line)
 				continue
-			elif isinstance(cmds,str):
+			elif isinstance(cmds,str) or isinstance(cmds,unicode):
 				cmds = CNC.breakLine(cmds)
 			else:
 				new.append(line)
@@ -4615,7 +4647,7 @@ class GCode:
 
 		def add(line, path):
 			if line is not None:
-				if isinstance(line,str):
+				if isinstance(line,str) or isinstance(line,unicode):
 					queue.put(line+"\n")
 				else:
 					queue.put(line)
